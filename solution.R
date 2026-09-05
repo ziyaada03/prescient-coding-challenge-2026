@@ -43,21 +43,13 @@
 # ---- Every tuneable number lives here. Fewer is better. ---------------------
 
 PARAMS <- list(
-  reversion_days = 120,   # lookback for the price-reversal signal (see build_signal) --
-                          # chosen for year-to-year SIGN STABILITY (~90% of years agree),
-                          # not for the best-looking backtest number
-  z_window       = 500,   # ~2 years: one shared "what counts as unusual right now" lookback,
-                          # used to normalise both the reversal signal and the carry spread
-  z_cap          = 2.5,   # cap on any z-score before use, so one extreme day cannot dominate
-  carry_weight   = 0.6,   # weight of the bonds-vs-cash carry signal relative to reversion (=1)
-  target_active  = 0.175, # fixed L1 size (sum of |active weight|) the raw signal is scaled to
-                          # before legality/cost control -- direction comes from the signal,
-                          # size does not, which keeps the realised active weight away from
-                          # rule 6's 5% floor regardless of how strong today's z-scores are
-  trade_speed    = 0.07,  # fraction of the remaining gap to target closed per day -- kept
-                          # slow: cost drag scales directly with this, and a sweep showed
-                          # excess was flat-to-better at slower speeds, not just cheaper
-  deadband       = 0.010  # ignore target moves smaller than this -- not worth the trading cost
+  reversion_days = 120,
+  z_window       = 500,
+  z_cap          = 2.5,
+  carry_weight   = 0.6,
+  target_active  = 0.175,
+  trade_speed    = 0.07,
+  deadband       = 0.010
 )
 
 # The rules, restated locally so this file reads on its own.
@@ -144,9 +136,9 @@ trailing_cum_return <- function(x, L) {
   if (n <= L) return(rep(NA_real_, n))
   logx <- log1p(x)
   missing <- is.na(logx)
-  logx[missing] <- 0                              # neutral placeholder, tracked separately below
+  logx[missing] <- 0
   csum      <- c(0, cumsum(logx))
-  miss_csum <- c(0, cumsum(as.numeric(missing)))  # count of missing days up to and including i
+  miss_csum <- c(0, cumsum(as.numeric(missing)))
   out <- rep(NA_real_, n)
   idx <- (L + 1):n
   clean <- (miss_csum[idx + 1] - miss_csum[idx - L + 1]) == 0
@@ -179,13 +171,11 @@ build_signal <- function(hist, params) {
   zw <- as.integer(params$z_window)
   zc <- as.numeric(params$z_cap)
 
-  # 1. mean reversion: fade a stretched move, sized by how stretched it is.
   for (a in REVERSION_ASSETS) {
     trail <- trailing_cum_return(hist$returns[, a], L)
     score[[a]] <- score[[a]] - trailing_z(trail, zw, zc)
   }
 
-  # 2. carry: bonds vs cash, symmetric.
   macro_cols <- colnames(hist$macro)
   if (all(c("sa_10y", "jibar_3m") %in% macro_cols) && nrow(hist$macro) > 0) {
     spread  <- hist$macro[, "sa_10y"] - hist$macro[, "jibar_3m"]
@@ -279,16 +269,10 @@ generate_weights <- function(hist, prev_weights, params) {
   # not enough history to estimate anything: sit on the benchmark
   if (nrow(hist$returns) < 260) return(bm)
 
-  # 1. signal -> fixed-size tilt -> target weights around the benchmark
   signal <- build_signal(hist, params)
   sized  <- scale_to_active_weight(signal, as.numeric(params$target_active))
   target <- make_legal(bm + sized, hist)
 
-  # 2. cost control, applied on top of the signal rather than inside it.
-  # No-trade band first: a target move too small to be worth its trading
-  # cost is treated as no move at all, per asset. Then partial adjustment:
-  # close only part of whatever gap survives the deadband, so a signal that
-  # flips does not cost a full round-trip in one day.
   prev <- prev_weights[hist$assets]
   gap  <- target - prev
   gap[abs(gap) < as.numeric(params$deadband)] <- 0
@@ -296,5 +280,8 @@ generate_weights <- function(hist, prev_weights, params) {
 
   make_legal(w, hist)
 }
+
+# AI tools used: Claude code, for research tooling, data exploration, and
+# iterating on candidate signals under our direction.
 
 # YOUR CODE GOES ABOVE THIS LINE ----------------------------------------------
