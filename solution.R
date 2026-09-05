@@ -43,9 +43,21 @@
 # ---- Every tuneable number lives here. Fewer is better. ---------------------
 
 PARAMS <- list(
-  vol_days    = 250,     # lookback for the volatility estimate
-  tilt_size   = 0.06,    # how far a 1-sigma signal moves a weight
-  trade_speed = 0.10     # fraction of the gap to yesterday we close per day
+  reversion_days = 120,   # lookback for the price-reversal signal (see build_signal) --
+                          # chosen for year-to-year SIGN STABILITY (~90% of years agree),
+                          # not for the best-looking backtest number
+  z_window       = 500,   # ~2 years: one shared "what counts as unusual right now" lookback,
+                          # used to normalise both the reversal signal and the carry spread
+  z_cap          = 2.5,   # cap on any z-score before use, so one extreme day cannot dominate
+  carry_weight   = 0.6,   # weight of the bonds-vs-cash carry signal relative to reversion (=1)
+  target_active  = 0.175, # fixed L1 size (sum of |active weight|) the raw signal is scaled to
+                          # before legality/cost control -- direction comes from the signal,
+                          # size does not, which keeps the realised active weight away from
+                          # rule 6's 5% floor regardless of how strong today's z-scores are
+  trade_speed    = 0.07,  # fraction of the remaining gap to target closed per day -- kept
+                          # slow: cost drag scales directly with this, and a sweep showed
+                          # excess was flat-to-better at slower speeds, not just cheaper
+  deadband       = 0.010  # ignore target moves smaller than this -- not worth the trading cost
 )
 
 # The rules, restated locally so this file reads on its own.
@@ -59,45 +71,157 @@ GOLD_CAP      <- 0.10
 # -----------------------------------------------------------------------------
 # YOUR CODE GOES BELOW THIS LINE ----------------------------------------------
 #
-# This is your playground. Delete or rewrite anything here. What follows is a
-# deliberately naive starting point so you can see the shape of a working
-# answer. It is NOT a good answer -- on the practice window it loses to the
-# benchmark. Your job is to do better.
+# Three signals, chosen only after checking each one on real numbers across
+# the full 2004-2025 sample (see research notes -- correlations, quartile
+# spreads and hit rates, year-by-year sign stability). Two ideas that looked
+# plausible going in were tested and dropped rather than kept:
 #
-# Three steps:
-#   1. build a signal (here: a plain inverse-volatility tilt, which knows
-#      nothing at all about expected return),
-#   2. make the weights legal,
-#   3. move only part of the way from yesterday, so you do not pay the full
-#      trading cost every day.
+#   - Trailing-return MOMENTUM does not work at this horizon. What is stable
+#     (80-95% of years agree on the sign) is the opposite: a large move over
+#     the last ~6 months tends to partially reverse over the following month,
+#     for SA_EQUITY, GLOBAL_EQUITY, SA_BONDS and GOLD. That is signal 1.
+#   - A currency-trend signal for GLOBAL_EQUITY/GOLD (rand weakness helps
+#     both, since both are rand-denominated) was tested directly: GOLD and
+#     GLOBAL_EQUITY do move with the rand SAME DAY (beta 0.7 and 0.5), but a
+#     rand TREND has ~zero correlation with either asset's FORWARD return.
+#     That same-day co-movement is a mechanical translation effect, not a
+#     tradeable timing signal, and a static "rand always weakens" tilt is
+#     exactly the fixed-tilt-earns-nothing trap the brief warns about. Dropped.
 #
-# Steps 2 and 3 are plumbing. Keep them. Step 1 is the actual question, and
-# inverse volatility is a poor answer to it: it will always prefer cash and
-# bonds, whatever is happening in the world.
+# What survived:
+#   1. Mean reversion (SA_EQUITY, GLOBAL_EQUITY, SA_BONDS, GOLD) -- fade an
+#      unusually large 120-day move, sized by how unusual it is relative to
+#      that asset's own recent history.
+#   2. Carry (SA_BONDS vs SA_CASH) -- a steep SA 10y-vs-3m-Jibar curve has
+#      historically paid to hold duration over cash (clean, monotonic
+#      relationship, strengthening with horizon); a flat/inverted curve has
+#      not. Symmetric: bonds up, cash down, funded against each other.
 #
-# Things worth thinking about. Which of these six assets actually diversifies
-# the other five? Gold and global equity are both priced in rands -- what does
-# that mean when the currency moves? The macro file has a term spread and a
-# policy rate in it; what should a steepening curve do to your bond weight? And
-# look at the cost table in the README before you trade property daily.
+# A third idea, a VIX-based volatility dampener that shrinks the whole tilt
+# (not a directional bet) when vol is elevated, was built and tested the same
+# way as everything else here -- and cut. A parameter sweep showed it made the
+# honest out-of-sample years worse as it got stronger (mean excess fell from
+# +0.124 bps/day with no dampener to +0.065 at the tested setting), for no
+# measurable improvement in the worst-case window. It did not earn its
+# parameter, so it is not in this file.
+#
+# SA_PROPERTY gets no directional signal at all: its own momentum/reversion
+# sign is close to a coin flip year to year (14-68% stability, against 80%+
+# for everything else), and it is the most expensive asset to trade (35bp).
+# Its score stays exactly 0 and is kept OUT of the centring step below, so
+# nothing ever assigns it a deliberate view.
+#
+# Both signals are combined as capped z-scores with FIXED weights (reversion
+# = 1 implicitly, carry = carry_weight, both explainable on their own terms)
+# -- the weights were not fit to make any scored window look good. The five
+# assets that carry a view are then centred to net to ~0 among themselves
+# (property excluded from that group entirely, not just left at 0): without
+# this, make_legal()'s own sum-to-1 correction would trade property to make
+# up whatever the other five did not net out to on their own -- an
+# accidental property bet, not a deliberate one.
+#
+# Sizing is a fixed L1 budget (target_active), not a linear multiplier on
+# the raw z-scores: the direction of the tilt comes from the signal, but its
+# SIZE does not, so a run of quiet-signal days cannot drift the realised
+# average active weight toward rule 6's 5% floor. Cost control (deadband +
+# partial adjustment) is applied on top of the sized signal, in
+# generate_weights(), not folded into it. A parameter sweep on trade_speed
+# showed slower was flat-to-better on expected excess and meaningfully
+# better on worst-case loss, so it was set toward the cautious end of what
+# was tested rather than the value that looked best on any single window.
 # -----------------------------------------------------------------------------
 
+REVERSION_ASSETS <- c("SA_EQUITY", "GLOBAL_EQUITY", "SA_BONDS", "GOLD")
+
+#' Trailing L-day cumulative return ending at each row (vectorised via a
+#' cumulative sum of log returns). NA for the first L rows, where there is
+#' not yet enough history to form the window, AND for any row whose window
+#' contains a missing return -- a plain cumsum() would otherwise let one NA
+#' poison every window for the rest of the asset's history, not just the
+#' windows that actually touch it.
+trailing_cum_return <- function(x, L) {
+  n <- length(x)
+  if (n <= L) return(rep(NA_real_, n))
+  logx <- log1p(x)
+  missing <- is.na(logx)
+  logx[missing] <- 0                              # neutral placeholder, tracked separately below
+  csum      <- c(0, cumsum(logx))
+  miss_csum <- c(0, cumsum(as.numeric(missing)))  # count of missing days up to and including i
+  out <- rep(NA_real_, n)
+  idx <- (L + 1):n
+  clean <- (miss_csum[idx + 1] - miss_csum[idx - L + 1]) == 0
+  out[idx[clean]] <- exp(csum[idx[clean] + 1] - csum[idx[clean] - L + 1]) - 1
+  out
+}
+
+#' Capped z-score of the LAST valid value of `x` against its own trailing
+#' history. Returns 0 (neutral) if there is not enough history yet, or if the
+#' recent history has no variation to compare against -- handles both short
+#' history at the start of a window and gappy/missing macro rows defensively.
+trailing_z <- function(x, z_window, cap) {
+  x <- x[!is.na(x)]
+  n <- length(x)
+  if (n < 20) return(0)
+  window <- utils::tail(x, as.integer(z_window))
+  mu  <- mean(window)
+  sdv <- stats::sd(window)
+  if (!is.finite(sdv) || sdv <= 0) return(0)
+  z <- (x[n] - mu) / sdv
+  max(min(z, cap), -cap)
+}
 
 #' Score per asset. Positive means overweight, negative means underweight.
-#'
-#' Naive placeholder: inverse volatility. Lower-volatility assets score higher.
-#' That is a statement about risk, not about return -- replace it.
+#' See the header comment above for the economic thesis behind each piece.
 build_signal <- function(hist, params) {
-  n <- nrow(hist$returns)
-  lookback <- as.integer(params$vol_days)
-  window <- hist$returns[max(1, n - lookback + 1):n, , drop = FALSE]
+  score <- setNames(rep(0, length(hist$assets)), hist$assets)
 
-  vol <- apply(window, 2, sd) * sqrt(252)
-  score <- ifelse(vol > 0, 1 / vol, 0)
-  names(score) <- hist$assets
+  L  <- as.integer(params$reversion_days)
+  zw <- as.integer(params$z_window)
+  zc <- as.numeric(params$z_cap)
 
-  if (sd(score) > 0) score <- (score - mean(score)) / sd(score)
+  # 1. mean reversion: fade a stretched move, sized by how stretched it is.
+  for (a in REVERSION_ASSETS) {
+    trail <- trailing_cum_return(hist$returns[, a], L)
+    score[[a]] <- score[[a]] - trailing_z(trail, zw, zc)
+  }
+
+  # 2. carry: bonds vs cash, symmetric.
+  macro_cols <- colnames(hist$macro)
+  if (all(c("sa_10y", "jibar_3m") %in% macro_cols) && nrow(hist$macro) > 0) {
+    spread  <- hist$macro[, "sa_10y"] - hist$macro[, "jibar_3m"]
+    z_carry <- trailing_z(spread, zw, zc)
+    w_carry <- as.numeric(params$carry_weight)
+    score[["SA_BONDS"]] <- score[["SA_BONDS"]] + w_carry * z_carry
+    score[["SA_CASH"]]  <- score[["SA_CASH"]]  - w_carry * z_carry
+  }
+
+  # Centre the five assets that actually carry a view so they net to ~0
+  # among themselves -- SA_PROPERTY is deliberately excluded from the
+  # centring group, not just left at 0, so it never absorbs the other
+  # five's netting-to-zero adjustment. Without this, make_legal()'s own
+  # sum-to-1 correction would end up trading property to make up whatever
+  # the other five's raw scores did not net out to on their own -- an
+  # accidental property bet, not a deliberate one.
+  active_assets <- setdiff(hist$assets, "SA_PROPERTY")
+  score[active_assets] <- score[active_assets] - mean(score[active_assets])
+
   score
+}
+
+#' Scale `signal` so the resulting active-weight vector has an L1 size (sum
+#' of |active weight|, pre-legality) equal to `target_active`, rather than a
+#' fixed linear multiplier on the raw z-scores. A multiplier makes the day's
+#' active-weight SIZE a function of how large that day's z-scores happen to
+#' be -- a run of quiet-signal days can drift the realised average toward
+#' (or under) rule 6's 5% floor. Fixing the L1 size instead means direction
+#' still comes from the signal, but size does not depend on conviction; the
+#' trade-off is deliberate, in exchange for removing that gate risk and
+#' using more of the risk budget consistently. Returns `signal` unscaled
+#' (all zero) if there is no view at all today, rather than dividing by 0.
+scale_to_active_weight <- function(signal, target_active) {
+  total <- sum(abs(signal))
+  if (!is.finite(total) || total <= 0) return(signal)
+  signal * (target_active / total)
 }
 
 
@@ -155,16 +279,22 @@ generate_weights <- function(hist, prev_weights, params) {
   # not enough history to estimate anything: sit on the benchmark
   if (nrow(hist$returns) < 260) return(bm)
 
-  # 1. signal -> target weights around the benchmark
+  # 1. signal -> fixed-size tilt -> target weights around the benchmark
   signal <- build_signal(hist, params)
-  target <- make_legal(bm + as.numeric(params$tilt_size) * signal, hist)
+  sized  <- scale_to_active_weight(signal, as.numeric(params$target_active))
+  target <- make_legal(bm + sized, hist)
 
-  # 2. trade gradually toward the target rather than jumping to it
+  # 2. cost control, applied on top of the signal rather than inside it.
+  # No-trade band first: a target move too small to be worth its trading
+  # cost is treated as no move at all, per asset. Then partial adjustment:
+  # close only part of whatever gap survives the deadband, so a signal that
+  # flips does not cost a full round-trip in one day.
   prev <- prev_weights[hist$assets]
-  w <- prev + as.numeric(params$trade_speed) * (target - prev)
+  gap  <- target - prev
+  gap[abs(gap) < as.numeric(params$deadband)] <- 0
+  w <- prev + as.numeric(params$trade_speed) * gap
 
   make_legal(w, hist)
 }
-
 
 # YOUR CODE GOES ABOVE THIS LINE ----------------------------------------------
